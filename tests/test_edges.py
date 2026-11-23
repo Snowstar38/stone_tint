@@ -3,11 +3,16 @@ from lua_harness import load_lua
 
 
 def check(name, *, drawn=999, lower=False, rough=True, smooth=True,
-          source=True, occupied=False, flags=1, expected=1, budget=True):
+          source=True, occupied=False, flags=1, expected=1, budget=True,
+          spat=0, floorkey=None, grass=False, mode='smart'):
     lua, mod, _ = load_lua()
     lua.execute('''
         local mod, drawn, lower, rough, smooth, source, occupied, flags,
-            expected, budget = ...
+            expected, budget, spat, floorkey, grass, mode = ...
+        -- grass: the north neighbour (10,9) is a tile Stone Tint does not tint,
+        -- whose own edge byte DF keeps (EDGES UNDER DF'S EDGES).
+        local GRASS_BYTE = 0x12 << 24
+        if grass then flags = flags | GRASS_BYTE end
         local function get(f, name)
             for i=1,100 do
                 local n,v = debug.getupvalue(f,i)
@@ -27,7 +32,7 @@ def check(name, *, drawn=999, lower=False, rough=True, smooth=True,
         local render = mod.StoneTintOverlay.onRenderFrame
         local paint = get(render, 'paint_edges')
         local state = get(render, 'state')
-        state.rough, state.smooth = rough, smooth
+        state.rough, state.smooth, state.edges = rough, smooth, mode
         state.hide_overlays = false
         local env = get(render, '_ENV')
         env.update_ramp_overlays = function() end
@@ -39,7 +44,8 @@ def check(name, *, drawn=999, lower=False, rough=True, smooth=True,
                 screentexpos_background={[0]=bg},
                 screentexpos_ramp_flag={[0]=0},
                 screentexpos_floor_flag={[0]=f},
-                screentexpos_background_two={[0]=occupied and 88 or 0}}
+                screentexpos_background_two={[0]=occupied and 88 or 0},
+                screentexpos_spatter={[0]=spat}}
         end
         local target = viewport(drawn, flags)
         local main = lower and viewport(0, 0) or target
@@ -52,14 +58,18 @@ def check(name, *, drawn=999, lower=False, rough=True, smooth=True,
         set(render, 'tint_strength', state.strength)
         set(render, 'known_texpos', {[999]=false})
         local cells = 0
-        set(render, 'paint_cell', function() cells=cells+1 end)
+        set(render, 'paint_cell', function()
+            cells=cells+1
+            if floorkey then set(paint, 'cell_key', floorkey) end
+            return 1
+        end)
         set(render, 'level_caches', function() return {}, {} end)
         -- Keep the real edge-source eligibility check and real flag handling.
         df.tiletype_shape.FLOOR = 10
         df.tiletype = {attrs={[1]={shape=10, special=1, material=1},
             [2]={shape=10, special=99, material=1}}}
         dfhack.maps = {
-            getTileType=function() return source and 1 or 2 end,
+            getTileType=function(x, y) if y == 9 then return 2 end return source and 1 or 2 end,
             getTileFlags=function() return {hidden=false} end,
         }
         local lookups = 0
@@ -68,17 +78,36 @@ def check(name, *, drawn=999, lower=False, rough=True, smooth=True,
             lookups=lookups+1; return 2
         end)
         set(paint, 'tint_texpos', function(key,colour,id,strength,remaining)
-            assert(colour==1 and id==2)
+            assert(colour==1 and id==2 and (spat==0 or mode=='simple'), 'single edge without spatter')
             return budget and 777 or nil, remaining
+        end)
+        -- 207983 is readable snow; 999999 is a picture that cannot be read.
+        set(paint, 'spatter_pixels', function(t) return t == 207983 and {} or false end)
+        set(paint, 'edges_texpos', function(keys, n, strength, remaining, sp, floor)
+            if floor then
+                assert(mode=='smart', 'floor-under path only in smart mode')
+                assert(floor==floorkey and sp==nil and n==1, 'floor-under path')
+                return budget and 999 or nil, remaining
+            end
+            assert(spat==207983 and sp==207983 and n==1, 'spatter goes through the combined path')
+            return budget and 888 or nil, remaining
         end)
         render({}, nil, nil)
         assert(mod.stone_tint_stats.edges==expected, 'edge count')
-        assert(target.screentexpos_floor_flag[0]==(expected==1 and 0 or flags),
-            'only clear flags when replacement is ready')
+        local kept = grass and GRASS_BYTE or 0
+        assert(target.screentexpos_floor_flag[0]==(expected==1 and kept or flags),
+            'only clear our flags when replacement is ready; DF keeps its own')
+        local under = expected==1 and grass and floorkey and mode=='smart'
+        assert(target.screentexpos_background[0]==(under and 999 or drawn),
+            'floor picture holds the edges only under DF edges on a tinted floor')
         assert(target.screentexpos_background_two[0]==
-            (expected==1 and 777 or occupied and 88 or 0), 'replacement texture')
+            (under and 0 or expected==1 and (spat ~= 0 and mode=='smart' and 888 or 777)
+                or occupied and 88 or 0),
+            'replacement texture')
         assert(cells==(drawn==1234 and 1 or 0), 'floor-art eligibility unchanged')
-    ''', mod, drawn, lower, rough, smooth, source, occupied, flags, expected, budget)
+        assert(target.screentexpos_spatter[0]==spat, 'DF spatter left in place')
+    ''', mod, drawn, lower, rough, smooth, source, occupied, flags, expected, budget,
+        spat, floorkey, grass, mode)
     print(f'PASS {name}')
 
 
@@ -94,3 +123,24 @@ check('texture budget exhausted', budget=False, expected=0)
 check('unrecognized lower-level terrain', lower=True)
 check('recognized lower-level terrain', drawn=1234, lower=True)
 check('lower-level rough tint disabled', lower=True, rough=False, expected=0)
+check('snow on receiver: edge with snow baked in', spat=207983)
+check('snow on receiver below: edge with snow baked in', lower=True, spat=207983)
+check('unreadable spatter picture: left to DF', spat=999999, expected=0)
+check('snow but budget exhausted: left to DF this frame', spat=207983, budget=False,
+      expected=0)
+check('grass edge too, tinted floor: our edge goes into the floor picture',
+      drawn=1234, floorkey=4242, grass=True)
+check('grass edge too, tinted floor below: into the floor picture', drawn=1234,
+      floorkey=4242, grass=True, lower=True)
+check('grass edge too, snow: floor picture, DF draws the snow itself', drawn=1234,
+      floorkey=4242, grass=True, spat=207983)
+check('grass edge too, floor not tinted: our layer as before', grass=True)
+check('tinted floor, no DF edge left: our layer as before', drawn=1234, floorkey=4242)
+check('grass edge too, budget exhausted: nothing this frame', drawn=1234,
+      floorkey=4242, grass=True, budget=False, expected=0)
+check('simple: snow ignored, edge on top as in 1.2.1', spat=207983, mode='simple')
+check('simple: grass too, still our layer', drawn=1234, floorkey=4242, grass=True,
+      mode='simple')
+check('off: nothing tinted, DF keeps its edges', mode='off', expected=0)
+check('off: with grass and snow, untouched', drawn=1234, floorkey=4242, grass=True,
+      spat=207983, mode='off', expected=0)

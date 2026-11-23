@@ -1,6 +1,39 @@
--- Tint natural stone and soil floors, engraved floors, stairs and ramps by their
--- actual material.
+-- Tint natural stone and soil floors, stairs and ramps by their material.
 --@ module = true
+
+--[====[
+
+stone-tint
+==========
+
+Tags: fort | graphics | map
+
+Tints natural stone and soil floors, engraved floors, stairs and ramps in the
+colour of what they are made of, on your level and the levels you can see
+below. Works with graphics mods: it tints whatever floor art your world loads.
+
+Usage
+-----
+
+``stone-tint``
+    Open the settings window: strength, which tiles to tint, and floor edges.
+``stone-tint set <strength>``
+    Set the strength: 0 (off), 10, 15, 20, 25, 30, 40, 50, 75 or 100.
+``stone-tint edges smart|simple|off``
+    How tinted floor edges are drawn. ``smart`` (default) keeps snow, mud,
+    leaves and grass edges on top of them; ``simple`` draws them on top of
+    everything; ``off`` leaves edges untinted.
+``stone-tint blend default|legacy``
+    ``legacy`` is the flatter tint from before 1.2.0.
+``stone-tint status``
+    What was tinted last frame and which art was read.
+``stone-tint clear-cache``
+    Reread the materials, if a changed tile shows a stale colour.
+
+If nothing is tinted, enable the overlay with ``overlay enable stone-tint.map``.
+Settings are saved with each fortress.
+
+]====]
 
 local overlay = require('plugins.overlay')
 local tile_material = require('tile-material')
@@ -260,7 +293,8 @@ local map_max_x, map_max_y      -- tile bounds, refreshed on map load
 -- ones, so it is the one that should be asked for. The rest add tint to tiles
 -- this mod now handles, which is what the update is for.
 local state = {strength=50, rough=true, smooth=true, stairs=true, ramps=true, soil=true,
-               hide_overlays=false, engraved=true, faces=true, blend='default'}
+               hide_overlays=false, engraved=true, faces=true, blend='default',
+               edges='smart'}
 local view
 
 -- Running stone-tint from the console re-executes this whole file in the same
@@ -333,6 +367,29 @@ local function palette_of(ci)
     return pal
 end
 
+-- SOIL ON A ROCK LAYER. A soil tile reads its material from its geological
+-- layer, but the layer boundary steps between columns, so a soil floor can sit
+-- in a column whose layer at that z is rock: measured 2026-11-22, a SoilFloor
+-- at (109,122,84) whose layer is siltstone, beside one in fire clay, both
+-- named "fire clay" by DF on hover. tile-material then returns the rock and
+-- the floor took siltstone's ecru. DF's own answer is the soil layer: the
+-- deepest soil layer above that rock in the same biome's list.
+local function soil_above_rock(x, y, z)
+    local rx, ry = dfhack.maps.getTileBiomeRgn(x, y, z)
+    local region = dfhack.maps.getRegionBiome(rx, ry)
+    local biome = region and df.world_geo_biome.find(region.geo_index)
+    local block = dfhack.maps.getTileBlock(x, y, z)
+    if not biome or not block then return nil end
+    local index = block.designation[x % 16][y % 16].geolayer_index
+    for i = math.min(index, #biome.layers) - 1, 0, -1 do
+        local inorganic = df.inorganic_raw.find(biome.layers[i].mat_index)
+        if inorganic and inorganic.flags.SOIL_ANY then
+            return dfhack.matinfo.decode(0, biome.layers[i].mat_index)
+        end
+    end
+    return nil
+end
+
 -- The colour code for a tile: its colour index + 1, or 0 for none.
 local function colour_code(x, y, z)
     local ok, matinfo = pcall(tile_material.GetTileMat, x, y, z)
@@ -340,7 +397,19 @@ local function colour_code(x, y, z)
         local ok2, fallback = pcall(tile_material.GetLayerMat, x, y, z)
         matinfo = ok2 and fallback or nil
     end
-    local ci = matinfo and matinfo.material and material_colour(matinfo.material)
+    local material
+    -- GetTileMat returns a plain list of materials for some plant tiles;
+    -- those have no single colour.
+    pcall(function()
+        material = matinfo.material
+        local tt = dfhack.maps.getTileType(x, y, z)
+        if tt and df.tiletype.attrs[tt].material == df.tiletype_material.SOIL
+                and matinfo.inorganic and not matinfo.inorganic.flags.SOIL_ANY then
+            local soil = soil_above_rock(x, y, z)
+            if soil then material = soil.material end
+        end
+    end)
+    local ci = material and material_colour(material)
     return ci and ci + 1 or 0
 end
 
@@ -565,18 +634,81 @@ local function lay_over(dst, src)
     end
 end
 
+-- ==========================================
+-- SPATTER ART
+-- ==========================================
+-- The picture DF puts in a cell's spatter layer (snow, mud, blood, fallen
+-- leaves, fruit, whatever a mod adds), read straight out of DF's own texture:
+-- enabler.textures.raws[texpos] is an SDL_Surface, and for these it is 32x32
+-- ABGR8888, the same packing as cell_pixels. Measured 2026-11-22: 60 snow,
+-- mud and blood pictures read this way matched their PNG cells exactly, and
+-- leaves and fruit, which come from no [TILE_GRAPHICS] cell, read the same way.
+-- Cached by texpos; DF renumbers texposes when it resets its textures, so the
+-- cache and the composites' names follow spatter_gen (see sentinel_texpos).
+local SDL_ABGR8888 = 0x16762004
+local spatter_cells = {}      -- [texpos] = packed pixels, or false
+local spatter_gen = 0
+
+local function read_surface(texpos)
+    local raws = df.global.enabler.textures.raws
+    if texpos < 0 or texpos >= #raws then return false end
+    local surface = raws[texpos]
+    if not surface then return false end
+    local _, s = df.sizeof(df.reinterpret_cast('uint32_t', surface))
+    if not s or s == 0 then return false end
+    local function i32(a) return df.reinterpret_cast('int32_t', a).value end
+    local function u64(a) return df.reinterpret_cast('uint64_t', a).value end
+    local w, h, pitch = i32(s + 16), i32(s + 20), i32(s + 24)
+    local format, pixels = u64(s + 8), u64(s + 32)
+    if w ~= CELL_PX or h ~= CELL_PX or pitch < CELL_PX * 4 or format == 0 or pixels == 0 then
+        return false
+    end
+    if df.reinterpret_cast('uint32_t', format).value ~= SDL_ABGR8888 then return false end
+    local out, i = {}, 0
+    for y = 0, CELL_PX - 1 do
+        local row = pixels + y * pitch
+        for x = 0, CELL_PX - 1 do
+            local px = df.reinterpret_cast('uint32_t', row + x * 4).value
+            i = i + 1
+            out[i] = (px >> 24) == 0 and 0 or px
+        end
+    end
+    return out
+end
+
+local function spatter_pixels(texpos)
+    local px = spatter_cells[texpos]
+    if px == nil then
+        local ok, got = pcall(read_surface, texpos)
+        px = ok and got or false
+        spatter_cells[texpos] = px
+    end
+    return px
+end
+
 -- The texpos for several edge pieces at once: keys are tint keys
--- (code * ART_COUNT + id), in EDGE_SIDES order. Returns as tint_texpos does.
-local function edges_texpos(keys, n, strength, budget)
+-- (code * ART_COUNT + id), in EDGE_SIDES order; sp, if given, is the texpos of
+-- a spatter picture that goes on top (SPATTER ART); floor, if given, is the tint
+-- key of the cell's own floor, drawn first (EDGES UNDER DF'S EDGES). Returns as
+-- tint_texpos does.
+local function edges_texpos(keys, n, strength, budget, sp, floor)
     local skey = state.blend == 'legacy' and (strength .. ' legacy') or strength
     local store = stone_tint_textures[skey]
     if not store then store = {} stone_tint_textures[skey] = store end
     local name = 'edges ' .. table.concat(keys, ' ', 1, n)
+    if sp then name = name .. ' s' .. sp .. '/' .. spatter_gen end
+    if floor then name = 'f' .. floor .. ' ' .. name end
     local handle = store[name]
     if handle == nil then
         if budget <= 0 then return nil, budget end
         budget = budget - 1
         local pixels
+        if floor then
+            local id = (floor - 1) % ART_COUNT + 1
+            local entries = colour_entries((floor - id) // ART_COUNT - 1, strength)
+            pixels = entries and cell_pixels(ART_CELL[id], entries)
+            if not pixels then n = 0 end
+        end
         for i = 1, n do
             local key = keys[i]
             local id = (key - 1) % ART_COUNT + 1
@@ -586,6 +718,10 @@ local function edges_texpos(keys, n, strength, budget)
             if px then
                 if pixels then lay_over(pixels, px) else pixels = px end
             end
+        end
+        if pixels and sp then
+            local spx = spatter_pixels(sp)
+            if spx then lay_over(pixels, spx) else pixels = nil end
         end
         handle = false
         if pixels then
@@ -858,7 +994,7 @@ local function load_state()
     local saved = dfhack.persistent.getSiteData(GLOBAL_KEY, {})
     if tonumber(saved.strength) then state.strength = tonumber(saved.strength) end
     for _, k in ipairs({'rough', 'smooth', 'stairs', 'ramps', 'soil', 'hide_overlays',
-                        'engraved', 'faces', 'blend'}) do
+                        'engraved', 'faces', 'blend', 'edges'}) do
         if saved[k] ~= nil then state[k] = saved[k] end
     end
 end
@@ -1106,6 +1242,9 @@ end
 -- Per-frame values paint_cell reads, set at the top of each frame.
 -- frame_engraved is the art id an engraved floor gets this frame.
 local frame_strength, frame_budget, frame_engraved = 0, 0, ENGRAVED_FACE
+-- The tint key paint_cell wrote for the cell being visited, or nil. The render
+-- loops clear it before each cell, so paint_edges reads only its own cell's.
+local cell_key
 
 -- One cell DF drew with a texture that may be ours (its known_texpos entry is
 -- not false): works out which art it is, if any, and writes the tinted texture
@@ -1164,17 +1303,46 @@ local function paint_cell(bg, flags, index, drawn, wx, wy, z, colours, checks)
     end
     if not texpos then return nil end
     bg[index] = texpos
+    cell_key = key
     return ART_KIND[id]
 end
 
 -- The edges spilling onto any visible cell (FLOOR EDGES). The receiving
 -- terrain need not have tintable art. Returns how many sides it drew.
+--
+-- SPATTER ON TOP. DF draws its own edges before spatter (snow, mud, blood),
+-- so spatter covers them; background_two, where the tinted edge goes, is drawn
+-- after spatter, which put tinted edges on top of snow (reported 2026-11-22).
+-- So on a cell with spatter the texture made is the tinted edge with that
+-- cell's spatter picture laid over it (SPATTER ART), one picture in the layer
+-- this already uses. DF draws the same spatter underneath, so the cell looks
+-- as it would with DF's own edge, tinted. A spatter picture that cannot be
+-- read leaves the cell to DF: its own edge, under the spatter, untinted.
+--
+-- EDGES UNDER DF'S EDGES. A cell can also keep an edge DF draws itself, from a
+-- neighbour Stone Tint does not tint (grass, most often). DF draws those after
+-- the floor and before spatter, so a tinted edge in background_two lands on
+-- top of them: a dirt edge over the grass spilling onto the same tile
+-- (reported 2026-11-22). When the cell's own floor is one paint_cell just
+-- tinted, the tinted edges go into that floor's picture instead, so DF's edges
+-- and then the spatter are drawn over them in DF's own order. A cell whose
+-- floor is not tinted (constructed, sand, a switched-off kind) keeps the
+-- background_two picture.
+--
+-- EDGE MODES (the window's "Edges" setting): 'smart' is all of the above;
+-- 'simple' is 1.2.1's way, every tinted edge in background_two, over whatever
+-- DF draws; 'off' leaves every edge to DF, untinted.
 local edge_keys = {}
-local function paint_edges(floor_flags, bg2, index, wx, wy, z, colours)
+local function paint_edges(floor_flags, bg2, index, wx, wy, z, colours, spatter, bg)
+    local mode = state.edges
+    if mode == 'off' then return 0 end
     local f = floor_flags[index]
     if f == 0 then return 0 end
     f = math.tointeger(f)
     if not f or (f & 0xFFFFFFFF) == 0 or bg2[index] ~= 0 then return 0 end
+    local smart = mode ~= 'simple'
+    local sp = smart and spatter and spatter[index] or 0
+    if sp == 0 then sp = nil end
     local edges = edge_cache[z]
     if not edges then edges = {} edge_cache[z] = edges end
     local n, clear = 0, 0
@@ -1208,8 +1376,23 @@ local function paint_edges(floor_flags, bg2, index, wx, wy, z, colours)
         end
     end
     if n == 0 then return 0 end
+    local floor_key = smart and cell_key
+    if floor_key and bg and ((f & ~clear) & 0xFFFFFFFF) ~= 0 then
+        local name = 'f' .. floor_key .. ' ' .. table.concat(edge_keys, ' ', 1, n)
+        local texpos = tint_cache[name]
+        if texpos == nil then
+            texpos, frame_budget = edges_texpos(edge_keys, n, frame_strength, frame_budget,
+                nil, floor_key)
+            if texpos ~= nil then tint_cache[name] = texpos end
+        end
+        if not texpos then return 0 end
+        floor_flags[index] = f & ~clear
+        bg[index] = texpos
+        return n
+    end
+    if sp and not spatter_pixels(sp) then return 0 end
     local texpos
-    if n == 1 then
+    if n == 1 and not sp then
         local key = edge_keys[1]
         texpos = tint_cache[key]
         if texpos == nil then
@@ -1220,9 +1403,10 @@ local function paint_edges(floor_flags, bg2, index, wx, wy, z, colours)
         end
     else
         local name = table.concat(edge_keys, ' ', 1, n)
+        if sp then name = name .. ' s' .. sp end
         texpos = tint_cache[name]
         if texpos == nil then
-            texpos, frame_budget = edges_texpos(edge_keys, n, frame_strength, frame_budget)
+            texpos, frame_budget = edges_texpos(edge_keys, n, frame_strength, frame_budget, sp)
             if texpos ~= nil then tint_cache[name] = texpos end
         end
     end
@@ -1280,6 +1464,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     if sentinel ~= tint_sentinel then
         tint_sentinel = sentinel
         tint_cache = {}
+        spatter_cells, spatter_gen = {}, spatter_gen + 1
         refresh_texpos_maps(true)
     end
     if strength ~= tint_strength then
@@ -1307,6 +1492,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     local bg = vp.screentexpos_background
     local ramp_flags = vp.screentexpos_ramp_flag
     local floor_flags, bg2 = vp.screentexpos_floor_flag, vp.screentexpos_background_two
+    local spatter = vp.screentexpos_spatter
     local n_edges = 0
     local known = known_texpos
     local win_x, win_y = df.global.window_x, df.global.window_y
@@ -1335,13 +1521,14 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
                 end
                 local wy = win_y + sy
                 if wy >= 0 and wy < max_y then
+                    cell_key = nil
                     if drawn ~= 0 and known[drawn] ~= false then
                         local kind = paint_cell(bg, ramp_flags, index, drawn, wx, wy, z,
                             colours, checks)
                         if kind then counts[kind] = counts[kind] + 1 end
                     end
                     n_edges = n_edges + paint_edges(floor_flags, bg2, index, wx, wy, z,
-                        colours)
+                        colours, spatter, bg)
                 end
                 index = index + 1
             end
@@ -1374,6 +1561,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
             local sx = cell // dim_y
             local wy = win_y + cell - sx * dim_y
             if wy >= 0 and wy < max_y then
+                cell_key = nil
                 if drawn ~= 0 and known[drawn] ~= false then
                     local kind = paint_cell(lbg, lflags, cell, drawn, win_x + sx, wy, lz,
                         colours, checks)
@@ -1384,7 +1572,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
                 end
                 if ledges and lbg2 then
                     n_edges = n_edges + paint_edges(ledges, lbg2, cell, win_x + sx, wy, lz,
-                        colours)
+                        colours, lvp.screentexpos_spatter, lbg)
                 end
             end
         end
@@ -1444,8 +1632,8 @@ TintWindow = defclass(TintWindow, widgets.Window)
 TintWindow.ATTRS{
     frame_title='Stone Tint',
     -- Height is the body plus 4 (border and inset, top and bottom). The body
-    -- runs to the Close line at row 24, so 25 rows.
-    frame={w=44, h=29},
+    -- runs to the Close line at row 26, so 27 rows.
+    frame={w=44, h=31},
     resizable=false,
     autoarrange_subviews=true,
     autoarrange_gap=1,
@@ -1498,7 +1686,16 @@ function TintWindow:init()
         -- Global: every ramp's overlay goes, see RAMP OVERLAYS. Only while
         -- ramps are tinted.
         toggle('Hide ramp overlays:', 'CUSTOM_H', 'hide_overlays'),
-        widgets.Label{frame={t=24}, text={{key='LEAVESCREEN', text=': Close'}}},
+        -- EDGE MODES: Smart puts tinted edges under snow, mud, leaves and DF's
+        -- grass edges; Simple is 1.2.1's, always on top; Off leaves them to DF.
+        widgets.CycleHotkeyLabel{
+            label='Floor edges:', key='CUSTOM_D',
+            options={{label='Smart', value='smart'}, {label='Simple', value='simple'},
+                     {label='Off', value='off'}},
+            initial_option=state.edges or 'smart',
+            on_change=function(mode) set_edges(mode) end,
+        },
+        widgets.Label{frame={t=26}, text={{key='LEAVESCREEN', text=': Close'}}},
     }
 end
 
@@ -1522,6 +1719,12 @@ function set_blend(blend)
     save_state()
     entry_cache = {}
     tint_cache = {}
+    force_repaint()
+end
+
+function set_edges(mode)
+    state.edges = mode
+    save_state()
     force_repaint()
 end
 
@@ -1572,7 +1775,8 @@ elseif args[1] == 'status' then
     print(('stone-tint: overlay is %s'):format(
         overlay.isOverlayEnabled('stone-tint.map') and 'enabled' or 'disabled'))
     local st = reqscript('stone-tint').get_state()
-    print(('stone-tint: strength is %d%%, %s blend'):format(st.strength, st.blend or 'default'))
+    print(('stone-tint: strength is %d%%, %s blend, %s edges'):format(st.strength,
+        st.blend or 'default', st.edges or 'smart'))
     local art_ok, stats, hidden, engraved_found, engraved_pages, engraved_art, ar =
         reqscript('stone-tint').get_report()
     if ar and ar.source == 'live' then
@@ -1616,6 +1820,14 @@ elseif args[1] == 'blend' then
     end
     reqscript('stone-tint').set_blend(b)
     print('stone-tint: blend set to ' .. b)
+elseif args[1] == 'edges' then
+    local mode = args[2]
+    if mode ~= 'smart' and mode ~= 'simple' and mode ~= 'off' then
+        print(('stone-tint: edges are %s'):format(reqscript('stone-tint').get_state().edges or 'smart'))
+        qerror('use: stone-tint edges <smart|simple|off>')
+    end
+    reqscript('stone-tint').set_edges(mode)
+    print('stone-tint: edges set to ' .. mode)
 elseif args[1] == 'set' then
     local strength = tonumber(args[2])
     local valid = false
@@ -1632,4 +1844,5 @@ else
     print('     stone-tint status')
     print('     stone-tint set <' .. table.concat(STRENGTHS, '|') .. '>')
     print('     stone-tint blend <default|legacy>')
+    print('     stone-tint edges <smart|simple|off>')
 end

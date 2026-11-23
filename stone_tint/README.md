@@ -18,11 +18,12 @@ stone-tint
 ```
 
 The GUI offers Off, 10%, 15%, 20%, 25%, 30%, 40%, 50%, 75% and 100% strengths, and switches for
-rough, smooth and engraved floors, stairs, ramps, soil, engraving faces and ramp overlays.
-Settings persist with each fortress. The default is 50%.
+rough, smooth and engraved floors, stairs, ramps, soil, engraving faces and ramp overlays, and
+a choice of how floor edges are drawn. Settings persist with each fortress. The default is 50%.
 
 `stone-tint status` reports what was tinted in the last drawn frame, `stone-tint set <strength>`
-sets the strength, and `stone-tint clear-cache` rereads the materials.
+sets the strength, `stone-tint edges <smart|simple|off>` picks the floor edge mode, and
+`stone-tint clear-cache` rereads the materials.
 
 Stone Tint changes rendering only. It does not modify saves or map tiles.
 
@@ -39,6 +40,20 @@ a picture has no dwarf face to carve out, so "Engraving faces" changes nothing u
 The rough edges a floor spills onto its neighbours are tinted too, in the colour of the floor
 they come from, wherever the game draws an uneven edge, regardless of the neighbouring
 terrain. This also applies to visible edges on levels below the current one.
+
+## Floor edges
+
+"Floor edges" in the GUI picks how those tinted edges are drawn:
+
+- **Smart** (the default) keeps them in the game's own order. Snow, mud, blood and fallen
+  leaves lie on top of them, and a grass edge spilling onto the same tile overlaps them as it
+  would an untinted edge.
+- **Simple** is how 1.2.1 drew them: always on top, so they show through snow and over grass.
+- **Off** leaves every edge to the game, untinted.
+
+On a tile whose own floor is not tinted (a constructed floor, sand, or a kind you have switched
+off), a grass edge and a tinted edge landing on the same tile still draw with the tinted one on
+top in Smart mode.
 
 **You no longer need to delete floor, stair or ramp tiles from other mods.** If you did so for
 an earlier version, you can put them back. `stone-tint status` lists the pages the art was read

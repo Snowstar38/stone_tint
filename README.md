@@ -2,7 +2,7 @@
 
 A DFHack mod that colors natural stone and soil floors, stairs, and ramps by their material, with support for graphics mods.
 
-Version **1.2.1**. Source is in [`stone_tint/`](stone_tint/); see the [mod README](stone_tint/README.md) for features and settings.
+Version **1.3.0**. Source is in [`stone_tint/`](stone_tint/); see the [mod README](stone_tint/README.md) for features and settings.
 
 With contributions from [grungeisdead](https://github.com/grungeisdead85/stone_tint).
 
@@ -25,11 +25,14 @@ Source paths below are relative to `stone_tint/scripts_modinstalled/`:
 
 ### Tests
 
-Run the 12 offline edge-rendering regression checks from the repository root:
+Run the offline checks from the repository root: 26 edge-rendering checks, and 5
+pixel checks of the spatter and floor composites (these read `snow.png` from your
+game; set `DF_PATH` if Dwarf Fortress is not in the default Steam folder).
 
 ```sh
-python -m pip install lupa
+python -m pip install lupa Pillow
 python tests/test_edges.py
+python tests/test_spatter.py
 ```
 
 These use Lua 5.3 with mocked game state. For rendering changes, also check the
