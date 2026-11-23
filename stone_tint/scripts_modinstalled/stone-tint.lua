@@ -1312,7 +1312,7 @@ end
 --
 -- SPATTER ON TOP. DF draws its own edges before spatter (snow, mud, blood),
 -- so spatter covers them; background_two, where the tinted edge goes, is drawn
--- after spatter, which put tinted edges on top of snow (reported 2026-11-22).
+-- after spatter, which put tinted edges on top of snow.
 -- So on a cell with spatter the texture made is the tinted edge with that
 -- cell's spatter picture laid over it (SPATTER ART), one picture in the layer
 -- this already uses. DF draws the same spatter underneath, so the cell looks
@@ -1322,8 +1322,8 @@ end
 -- EDGES UNDER DF'S EDGES. A cell can also keep an edge DF draws itself, from a
 -- neighbour Stone Tint does not tint (grass, most often). DF draws those after
 -- the floor and before spatter, so a tinted edge in background_two lands on
--- top of them: a dirt edge over the grass spilling onto the same tile
--- (reported 2026-11-22). When the cell's own floor is one paint_cell just
+-- top of them: a dirt edge over the grass spilling onto the same tile.
+-- When the cell's own floor is one paint_cell just
 -- tinted, the tinted edges go into that floor's picture instead, so DF's edges
 -- and then the spatter are drawn over them in DF's own order. A cell whose
 -- floor is not tinted (constructed, sand, a switched-off kind) keeps the
