@@ -1232,7 +1232,31 @@ StoneTintOverlay.ATTRS{
     default_enabled=true,
 }
 
+local weather_original
+local function load_weather_lookup()
+    local script = 'internal/detailed_weather/colour'
+    local ok, weather = pcall(reqscript, script)
+    weather_original = ok and weather.original_of or nil
+end
+
+-- Detailed Weather swaps some floor sprites before this overlay runs.
+-- Resolve its copies only for floor art we already recognize. Copies can
+-- change with the weather, so share the lookup results for one frame only.
+local function weather_floor(texpos, known, cache)
+    local original = cache[texpos]
+    if original == nil then
+        original = weather_original(texpos)
+        local id = known[original]
+        if original == texpos or not id or (id ~= ENGRAVED and ART_KIND[id] ~= K_FLOOR) then
+            original = false
+        end
+        cache[texpos] = original
+    end
+    return original
+end
+
 function StoneTintOverlay:init()
+    load_weather_lookup()
     load_state()
     refresh_texpos_maps(true)
     refresh_map_bounds()
@@ -1495,6 +1519,7 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
     local spatter = vp.screentexpos_spatter
     local n_edges = 0
     local known = known_texpos
+    local weather_floors = weather_original and {}
     local win_x, win_y = df.global.window_x, df.global.window_y
     local max_x, max_y = map_max_x, map_max_y
     local counts = frame_counts
@@ -1522,6 +1547,9 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
                 local wy = win_y + sy
                 if wy >= 0 and wy < max_y then
                     cell_key = nil
+                    if weather_floors and drawn ~= 0 and not known[drawn] then
+                        drawn = weather_floor(drawn, known, weather_floors) or drawn
+                    end
                     if drawn ~= 0 and known[drawn] ~= false then
                         local kind = paint_cell(bg, ramp_flags, index, drawn, wx, wy, z,
                             colours, checks)
@@ -1562,6 +1590,9 @@ function StoneTintOverlay:onRenderFrame(dc, rect)
             local wy = win_y + cell - sx * dim_y
             if wy >= 0 and wy < max_y then
                 cell_key = nil
+                if weather_floors and drawn ~= 0 and not known[drawn] then
+                    drawn = weather_floor(drawn, known, weather_floors) or drawn
+                end
                 if drawn ~= 0 and known[drawn] ~= false then
                     local kind = paint_cell(lbg, lflags, cell, drawn, win_x + sx, wy, lz,
                         colours, checks)
@@ -1600,6 +1631,7 @@ end
 -- the previous fort's stone colours.
 dfhack.onStateChange[GLOBAL_KEY] = function(sc)
     if sc == SC_MAP_LOADED then
+        load_weather_lookup()
         palettes = {}
         entry_cache = {}
         tint_cache = {}
